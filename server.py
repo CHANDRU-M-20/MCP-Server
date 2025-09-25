@@ -2,10 +2,10 @@ from fastmcp import FastMCP
 import sys
 # import arxiv
 import os
-import json
+
 from typing import List, Dict, Optional
 from pathlib import Path
-import re
+
 
 
 mcp = FastMCP(name="MCP-Server")
