@@ -1,10 +1,10 @@
 from fastmcp import Client
-from typing import List
+from typing import List, Dict
 import asyncio
 from dotenv import load_dotenv
-import httpx
 import os
 import nest_asyncio
+from termcolor import colored
 from langchain_google_genai import ChatGoogleGenerativeAI
 
 nest_asyncio.apply()
@@ -15,28 +15,82 @@ class MCP_ChatBot:
     def __init__(self, mcp_server_url: str):
         self.mcp_server = mcp_server_url
         self.client: Client = None
-        self.client_context = None
         self.gemini_client = ChatGoogleGenerativeAI(
-            model="gemini-1.5-flash",
+            model="gemini-2.5-flash",
             google_api_key=os.getenv("GOOGLE_API_KEY"),
             temperature=0.7,
             max_tokens=2048,
         )
         self.available_tools: List[dict] = []
+        self.resource_cache: Dict[str, str] = {}  # Cache resource data
+
+    async def load_all_resources(self):
+        """Fetch all resources on startup and cache them."""
+        try:
+            resources_response = await self.client.list_resources()
+            
+            for resource in resources_response:
+                # Convert uri to string
+                uri_str = str(resource.uri)
+                print(f"Loading resource: {uri_str}")
+                try:
+                    result = await self.client.read_resource(uri=uri_str)
+                    
+                    # Extract content
+                    if hasattr(result, 'contents') and result.contents:
+                        content = result.contents[0]
+                        if hasattr(content, 'text'):
+                            self.resource_cache[uri_str] = content.text
+                        elif hasattr(content, 'blob'):
+                            self.resource_cache[uri_str] = str(content.blob)
+                    else:
+                        self.resource_cache[uri_str] = str(result)
+                    
+                    print(f"✓ Loaded: {uri_str}")
+                except Exception as e:
+                    print(f"✗ Error loading {uri_str}: {e}")
+            
+            print(f"\nCached {len(self.resource_cache)} resources")
+        except Exception as e:
+            print(f"Error loading resources: {e}")
+
+    def get_resource_context(self) -> str:
+        """Build context from all cached resources."""
+        if not self.resource_cache:
+            return ""
+        
+        context_parts = ["Available Data Sources:"]
+        for uri, content in self.resource_cache.items():
+            # Convert uri to string if it's not already
+            uri_str = str(uri)
+            resource_name = uri_str.split("://")[-1]
+            context_parts.append(f"\n[{resource_name}]:\n{content}")
+        print("----"*10)
+        print(colored(f"The get_resource_context function \n : value - {context_parts}","red"))
+        # print("\n".join(context_parts))
+        print("----"*10)
+        
+        return "\n".join(context_parts)
 
     async def process_query(self, query):
+        # Add resource context to every query
+        resource_context = self.get_resource_context()
+        
+        if resource_context:
+            enhanced_query = f"{query}\n\n{resource_context}"
+        else:
+            enhanced_query = query
+            
         message = [
             {
                 'role': 'user',
-                'content': query
+                'content': enhanced_query
             }
         ]
         
         # Convert tools to gemini-compatible format
         gemini_tools = []
-        
         for tool in self.available_tools:
-            # Gemini expects tools in a specific format
             gemini_tool = {
                 "name": tool["name"],
                 "description": tool["description"],
@@ -56,20 +110,14 @@ class MCP_ChatBot:
                 if response.content:
                     print(response.content)
                 
-                # Handle tool calls (Gemini Format)
                 if hasattr(response, 'tool_calls') and response.tool_calls:
-                    print(f"Debug: Found {len(response.tool_calls)} tool calls")
-                    
                     message.append({
                         'role': 'assistant',
                         'content': response.content,
                         'tool_calls': response.tool_calls
                     })
                     
-                    for i, tool_call in enumerate(response.tool_calls):
-                        print(f"Debug: Tool call {i}: {type(tool_call)} - {tool_call}")
-                        
-                        # Handle different tool_call formats
+                    for tool_call in response.tool_calls:
                         if hasattr(tool_call, 'name'):
                             tool_name = tool_call.name
                             tool_args = tool_call.args
@@ -84,10 +132,7 @@ class MCP_ChatBot:
                                 tool_args = tool_call.get('args', {})
                                 tool_id = tool_call.get('id', f"call_{tool_name}")
                         else:
-                            print(f"Unexpected tool_call format: {type(tool_call)}")
                             continue
-                
-                        print(f"Debug: Calling tool '{tool_name}' with args: {tool_args}")
                 
                         if isinstance(tool_args, str):
                             import json
@@ -97,7 +142,6 @@ class MCP_ChatBot:
                                 pass
                         
                         try:
-                            # Fixed: Use call_tool instead of ainvoke
                             result = await self.client.call_tool(
                                 name=tool_name,
                                 arguments=tool_args
@@ -105,7 +149,7 @@ class MCP_ChatBot:
                             
                             message.append({
                                 "role": "tool",
-                                "content": str(result.content),  # Fixed: access result.content
+                                "content": str(result.content),
                                 "tool_call_id": tool_id
                             })
                             
@@ -133,9 +177,12 @@ class MCP_ChatBot:
             print(f"Error processing query: {e}")
     
     async def chat_loop(self):
-        print("MCP ChatBot started")
-        print("Type your queries or 'quit'/'exit' to stop")
+        print("\n" + "="*50)
+        print("MCP ChatBot Started")
+        print("="*50)
         print("Available Tools:", [tool["name"] for tool in self.available_tools])
+        print("Cached Resources:", list(self.resource_cache.keys()))
+        print("\nType your queries or 'quit'/'exit' to stop")
         print("-" * 50)
         
         while True:
@@ -160,15 +207,11 @@ class MCP_ChatBot:
     async def initialize_connect(self):
         try:
             self.client = Client(self.mcp_server)
-            
-            # Use the client as an async context manager
             await self.client.__aenter__()
             
+            # Fetch tools
             tools_response = await self.client.list_tools()
-            
-            print(f"Connected to the mcp_server {self.mcp_server}")
-            
-            print("Available Tools:", [tool.name for tool in tools_response])
+            print(f"Connected to MCP Server: {self.mcp_server}")
             
             self.available_tools = []
             for tool in tools_response:
@@ -177,6 +220,9 @@ class MCP_ChatBot:
                     "description": getattr(tool, "description", ''),
                     "input_schema": getattr(tool, 'inputSchema', {})
                 })
+            
+            # AUTO-LOAD ALL RESOURCES
+            await self.load_all_resources()
             
             return True
         except Exception as e:
